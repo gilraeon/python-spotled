@@ -294,6 +294,47 @@ def gen_bitmap(*lines, min_len=0, true_char='1'):
             )
     return bytes(data)
 
+def gen_bd28_bitmap(*lines, min_len=0, colormap=None):
+    """
+    Converts a "text" bitmap consisting of . and <colormap index>
+    to a raw binary bitmap with 24 bit colour depth.
+    min_len sets the minimum
+    row length.
+    """
+    if min_len % 8 != 0:
+        min_len += 8 - (min_len % 8)
+
+    #print(lines)
+
+    if colormap == None:
+        colormap = [[0x00, 0x00, 0x00],
+                    [0xff, 0xff, 0xff],
+                    [0xff, 0x00, 0x00],
+                    [0x00, 0xff, 0x00],
+                    [0x00, 0x00, 0xff],
+                    [0xff, 0xff, 0x00],
+                    [0x00, 0xff, 0xff],
+                    [0xff, 0x00, 0xff]]
+
+    data = bytearray()
+    for text in lines:
+        if len(text) < min_len:
+            text += '.' * (min_len - len(text))
+        else:
+            excess = len(text) % 8
+            if excess != 0:
+                text += '.' * (8 - excess)
+        for i in range(0, len(text)):
+            if(text[i] != '.'):
+                data.append(colormap[int(text[i])][0])
+                data.append(colormap[int(text[i])][1])
+                data.append(colormap[int(text[i])][2])
+            else:
+                data.append(0)
+                data.append(0)
+                data.append(0)
+    return bytes(data)
+
 class TimeData:
     """
     The amount of time in milliseconds to show each frame of
@@ -764,25 +805,86 @@ def lines_to_frames(lines, font_data, align=Align.CENTER, width=48, lines_per_fr
 
     return raster_frames
 
+def lines_to_frames_bd28(lines, font_data, align=Align.CENTER, width=48, lines_per_frame=2, line_height=6):
+    raster_lines = []
+    escaped = 0
+    color_index = 1
+    for line in lines:
+        raster_line = ['' for _ in range(line_height)]
+        for char in line:
+            if(escaped):
+                color_index = char
+                escaped = 0
+                continue
+            if(char == '%'):
+                escaped = 1
+                continue
+            char_data = find_char_in_font(char, font_data)
+            height = len(char_data)
+            if height > line_height:
+                raise ValueError('Character height exceeds line height.')
+            if height < line_height:
+                pad_character_to_height(char_data, line_height, len(char_data[0]))
+            for i, char_line in enumerate(char_data):
+                raster_line[i] += char_line.replace('1',color_index)
+        while len(raster_line[0]) > width:
+            overflow_line = []
+            for i in range(len(raster_line)):
+                overflow_line.append(raster_line[i][:width])
+                raster_line[i] = raster_line[i][width:]
+            raster_lines.append(overflow_line)
+        if len(raster_line[0]) < width:
+            for i in range(len(raster_line)):
+                raster_line[i] = pad_row_to_width(raster_line[i], width, align)
+        raster_lines.append(raster_line)
+    raster_frames = []
+    current_frame = []
+    current_frame_line_length = 0
+    for raster_line in raster_lines:
+        if current_frame_line_length < lines_per_frame:
+            current_frame.extend(raster_line)
+            current_frame_line_length += 1
+        else:
+            raster_frames.append(current_frame)
+            current_frame = raster_line
+            current_frame_line_length = 1
+    if len(current_frame) > 0:
+        if current_frame_line_length < lines_per_frame:
+            for _ in range(lines_per_frame - current_frame_line_length):
+                current_frame.extend(['.' * width for _ in range(line_height)])
+        raster_frames.append(current_frame)
+
+    return raster_frames
+
 class LedConnection:
+# Repurposed for BD28 - TODO subclass this for different display types
     def __init__(self, address):
         self.connection = GATTRequester(address)
         self._ensure_connection()
-        self.connection.write_by_handle(0x0f, b'\x00\x00\x00\x01') # request notifications
+        self.connection.set_mtu(512)
+        self.connection.exchange_mtu(512)
+        #self.connection.write_by_handle(0x0f, b'\x00\x00\x00\x01') # request notifications - doesn't work on BD28, don't know why yet
         self.connection.on_notification = lambda handle, data: self._on_notification(handle, data)
         self.cmd_handle, self.data_handle = _discover_handles(self.connection)
-        
+
         self.current_wait_event = Event()
         self.last_data = None
         self.data_serial_no = 0
         self.command_serial_no = 0
 
-        self.buffer_size = self.query_command(GetBufferSizeCommand()).buffer_size
-        display_info = self.query_command(GetDisplayInfoCommand())
-        self.width = display_info.width
-        self.height = display_info.height
-        self.frame_limit = display_info.frame_limit
-        self.brightness = display_info.brightness
+        #self.buffer_size = self.query_command(GetBufferSizeCommand()).buffer_size # Also doesn't work on BD28, not sure why
+        #display_info = self.query_command(GetDisplayInfoCommand())
+        #self.width = display_info.width
+        #self.height = display_info.height
+        #self.frame_limit = display_info.frame_limit
+        #self.brightness = display_info.brightness
+
+        self.buffer_size = 32768 # randomly large number
+        self.width = 96
+        self.height = 16
+        self.frame_limit = 1
+        self.brightness = 1
+
 
     def _on_notification(self, handle, data):
         if handle == self.cmd_handle:
@@ -806,10 +908,11 @@ class LedConnection:
                 pass
             for _ in range(50):
                 if self.connection.is_connected():
-                    break
+                    return True
                 time.sleep(0.1)
             else:
-                raise TimeoutError("Timeout exceeded waiting for bluetooth connection.")
+                raise TimeoutError("Timeout connecting to Bluetooth device")
+                return False
 
     def send_command(self, command):
         """
@@ -851,16 +954,19 @@ class LedConnection:
 
         payload = data_command.serialize()
         self.send_command(SendingDataStartCommand(serial_no, data_command.command_type, len(payload)))
-        response = self.wait_for_response(timeout)
-        assert type(response) == SendingDataResponse
-        assert response.serial_no == serial_no
-        assert response.command_type == data_command.command_type
-        assert response.error_code == 0
+        #response = self.wait_for_response(timeout)
+        #print("_send_data_internal: SendingDataStartCommand response.error_code {}".format(response.error_code))
+        #assert type(response) == SendingDataResponse
+        #assert response.serial_no == serial_no
+        #assert response.command_type == data_command.command_type
+        #assert response.error_code == 0
 
         seek = 0
         sent_payloads = 0
-        send_size = 20
+        send_size = 182
         send_count = self.buffer_size // send_size
+
+        self.current_wait_event.clear()
 
         while seek < len(payload):
             self.current_wait_event.clear()
@@ -870,21 +976,21 @@ class LedConnection:
 
             if sent_payloads >= send_count:
                 sent_payloads = 0
-                response = self.wait_for_response(timeout)
-                assert type(response) == ContinueSendingResponse
-                assert response.serial_no == serial_no
-                assert response.command_type == data_command.command_type
-                seek = response.continue_from
+                #response = self.wait_for_response(timeout)
+                #assert type(response) == ContinueSendingResponse
+                #assert response.serial_no == serial_no
+                #assert response.command_type == data_command.command_type
+                #seek = response.continue_from
         
         self.send_command(SendingDataFinishCommand(serial_no, data_command.command_type, len(payload)))
         self.wait_for_response(timeout)
 
-    def send_data(self, data_command, timeout=0.2, attempts=5):
+    def send_data(self, data_command, timeout=0.2, attempts=1):
         """
         Send a data command to the device.
         Currently only SendDataCommand is used, which accepts raw serialized data.
         """
-        for i in range(attempts + 1):
+        for i in range(attempts):
             try:
                 self._send_data_internal(data_command, timeout)
                 return
@@ -940,6 +1046,32 @@ class LedConnection:
         frame_data = SendDataCommand(
             AnimationData(
                 [FrameData(self.width, self.height, gen_bitmap(*frame)) for frame in frames],
+                int(frame_duration * 1000),
+                speed,
+                effect
+            ).serialize()
+        )
+
+        self.send_data(frame_data)
+
+    def set_text_bd28(self, text, font="5x7", line_height=8, align=Align.LEFT,frame_duration=2, speed=0, effect=Effect.NONE, colours=None):
+
+        '''
+        Sets text on BD28 96x16 pixel display
+        '''
+        font_data = find_and_load_font(font)
+
+        lines = text.replace('\r', '').split('\n')
+        frames = lines_to_frames_bd28(lines, font_data, align, self.width, self.height // line_height, line_height)
+
+        if len(frames) > 1:
+            raise ValueError("set_text_bd28: display of > 1 lines not yet implemented.")
+
+        #print("set_text_bd28: {} frames, frame 0 length: {}".format(len(frames),len(frames[0][0])))
+
+        frame_data = SendDataCommand(
+            AnimationData(
+                [FrameData(self.width, self.height, gen_bd28_bitmap(*frame), depth=24) for frame in frames],
                 int(frame_duration * 1000),
                 speed,
                 effect
